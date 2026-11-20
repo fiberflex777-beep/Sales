@@ -2,6 +2,7 @@
 import re
 from datetime import datetime
 
+import pandas as pd
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QDialog
 from PyQt6.QtCore import QObject
 
@@ -80,17 +81,7 @@ class DataMixin(QObject):
         pandas = self._get_pd()
 
         headers = df_raw.iloc[headers_row_index].tolist()
-        col_map = {
-            'Код': 0,
-            'Арт': 3,
-            'Наименование': 5,
-            'Начальный остаток': 6,
-            'Приход': 7,
-            'Расход': 8,
-            'Конечный остаток': 9,
-            'Цена': 10,
-            'Категория товара': 11
-        }
+        col_map = fmt.SOURCE_COLUMNS
 
         max_col_index = len(headers) - 1
         for col_name, idx in col_map.items():
@@ -264,15 +255,9 @@ class DataMixin(QObject):
             return
 
         display_df = self.model.get_df()
-        orders_dict = {}
-        for _, row in display_df.iterrows():
-            code = str(row['Код'])
-            opt_val = row['Оптимальный заказ']
-            try:
-                order_qty = int(float(opt_val)) if opt_val else 0
-            except (ValueError, TypeError):
-                order_qty = 0
-            orders_dict[code] = order_qty
+        # Векторизованно: без построчного iterrows
+        orders_series = pd.to_numeric(display_df['Оптимальный заказ'], errors='coerce').fillna(0).astype(int)
+        orders_dict = dict(zip(display_df['Код'].astype(str), orders_series))
 
         self.model.batch_set_orders(orders_dict)
         self.update_total_sum()
@@ -311,25 +296,11 @@ class DataMixin(QObject):
                 )
                 return
 
-            # Формируем словарь {код: заказ}
-            orders_dict = {}
-            for _, row in df_import.iterrows():
-                code = str(row['Код']).strip()
-                if not code or pandas.isna(code):
-                    continue  # пропускаем строки без кода
-
-                # Преобразуем заказ в целое число (поддерживаем возможность float)
-                order_val = row['Заказ']
-                try:
-                    # Если значение не пустое и не NaN
-                    if pandas.notna(order_val):
-                        order_int = int(float(order_val))
-                    else:
-                        order_int = 0
-                except (ValueError, TypeError):
-                    order_int = 0
-
-                orders_dict[code] = order_int
+            # Формируем словарь {код: заказ} (векторизованно)
+            codes = df_import['Код'].astype(str).str.strip()
+            orders = pd.to_numeric(df_import['Заказ'], errors='coerce').fillna(0).astype(int)
+            mask = codes.ne('') & codes.ne('nan') & codes.ne('None')
+            orders_dict = dict(zip(codes[mask], orders[mask]))
 
             if not orders_dict:
                 QMessageBox.information(self, "Импорт", "В файле не найдено ни одной записи с кодом товара.")
@@ -396,25 +367,21 @@ class DataMixin(QObject):
 
             else:  # btn_supplier
                 # Режим "Для поставщика" – только колонки Код, Арт, Наименование, Заказ
-                pandas = self._get_pd()
 
-                # Берём полные данные и применяем пользовательские заказы
+                # Берём полные данные и применяем пользовательские заказы (векторизованно)
                 full_df = self.original_data.copy()
                 user_orders = self.model.get_user_orders() if self.model else {}
 
-                # Обновляем колонку Заказ в full_df
-                if 'Код' in full_df.columns:
-                    for idx, row in full_df.iterrows():
-                        code = str(row['Код'])
-                        if code in user_orders:
-                            full_df.at[idx, 'Заказ'] = user_orders[code]
-                            # Пересчитываем сумму (хотя для поставщика не нужна)
-                            if 'Цена' in full_df.columns:
-                                try:
-                                    price = float(row['Цена'])
-                                except (ValueError, TypeError):
-                                    price = 0.0
-                                full_df.at[idx, 'Сумма'] = user_orders[code] * price
+                if 'Код' in full_df.columns and user_orders:
+                    codes_str = full_df['Код'].astype(str)
+                    order_series = codes_str.map(user_orders)
+                    has_user_order = order_series.notna()
+                    full_df.loc[has_user_order, 'Заказ'] = order_series[has_user_order]
+                    if 'Цена' in full_df.columns:
+                        price = pd.to_numeric(full_df['Цена'], errors='coerce').fillna(0.0)
+                        full_df.loc[has_user_order, 'Сумма'] = (
+                            order_series[has_user_order] * price[has_user_order]
+                        )
 
                 # Фильтруем строки с заказом > 0 и выбираем нужные колонки
                 if 'Арт' in full_df.columns:
