@@ -2,7 +2,7 @@
 from PyQt6.QtWidgets import QMessageBox, QDialog
 from PyQt6.QtCore import QObject, Qt
 
-from dialogs import SettingsDialog
+from dialogs import SettingsDialog, save_settings
 from monthly_quantity_analysis_dialog import MonthlyQuantityAnalysisDialog
 from monthly_sum_analysis_dialog import MonthlySumAnalysisDialog
 from stock_distribution_dialog import StockDistributionDialog
@@ -24,6 +24,7 @@ class DialogsMixin(QObject):
             new_settings = dialog.get_settings()
             if new_settings != self.settings:
                 self.settings = new_settings
+                save_settings(new_settings)   # сохраняем между запусками
                 if self.original_data is not None and not self.original_data.empty:
                     self.recalculate_with_new_settings()
 

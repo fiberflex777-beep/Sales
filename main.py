@@ -1,10 +1,17 @@
 # main.py
 import sys
 import os
+import logging
 sys.path.insert(0, os.path.dirname(__file__))
 from PyQt6.QtWidgets import QApplication, QSplashScreen
 from PyQt6.QtGui import QPixmap, QFont, QPainter, QColor
 from PyQt6.QtCore import Qt, QTimer
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("app")
 
 def create_splash_screen():
     """Создаёт заставку с текстом (можно заменить на загрузку изображения)"""
@@ -67,7 +74,7 @@ def main():
             import pandas as pd
             _ = pd.DataFrame()
         except ImportError as e:
-            print(f"Предупреждение: не удалось предзагрузить pandas: {e}")
+            logger.warning("Не удалось предзагрузить pandas: %s", e)
 
     QTimer.singleShot(0, preload_critical_modules)
 

@@ -3,6 +3,8 @@ import re
 from datetime import datetime, timedelta
 from PyQt6.QtCore import QThread, pyqtSignal
 
+import report_format as fmt
+
 
 class CalculationWorker(QThread):
     progress = pyqtSignal(int)
@@ -50,8 +52,9 @@ class CalculationWorker(QThread):
         """Извлекает начальную и конечную даты периода из текста (ячейка E5)"""
         pd = self.pd
         period_text = "Не найден"
-        if len(self.raw_df) > 4 and self.raw_df.shape[1] > 4:
-            raw_period_val = self.raw_df.iloc[4, 4]
+        if (len(self.raw_df) > fmt.MIN_ROWS_FOR_PERIOD
+                and self.raw_df.shape[1] > fmt.MIN_COLS_FOR_PERIOD):
+            raw_period_val = self.raw_df.iloc[fmt.PERIOD_CELL]
             if pd.notna(raw_period_val):
                 period_text = str(raw_period_val).strip()
 
@@ -95,24 +98,21 @@ class CalculationWorker(QThread):
 
             # Проверяем наличие кода в первой колонке
             code_val = row.iloc[0] if len(row) > 0 else None
-            if pd.notna(code_val) and str(code_val) != '' and not str(code_val).startswith('|'):
+            if pd.notna(code_val) and str(code_val) != '' and not str(code_val).startswith(fmt.CONTINUATION_MARKER):
                 current_code = str(code_val)
                 if current_code not in movement_data_by_code:
                     movement_data_by_code[current_code] = []
                     movement_details_by_code[current_code] = []
 
             elif current_code:
-                # Проверяем, что первые пять колонок пусты (это строка движения)
-                first_five_empty = all(pd.isna(row.iloc[i]) or str(row.iloc[i]).strip() == ''
-                                      for i in range(5) if i < len(row))
-                sixth_col = row.iloc[5] if len(row) > 5 else None
-                is_movement_doc = pd.notna(sixth_col) and (
-                    'Расходная накл.' in str(sixth_col) or
-                    'Приходная накл.' in str(sixth_col) or
-                    'Возврат' in str(sixth_col)
-                )
+                # Проверяем, что первые N колонок пусты (это строка движения)
+                first_empty = all(pd.isna(row.iloc[i]) or str(row.iloc[i]).strip() == ''
+                                  for i in range(fmt.MOVEMENT_EMPTY_PREFIX_COLS) if i < len(row))
+                sixth_col = row.iloc[fmt.MOVEMENT_DOC_COL] if len(row) > fmt.MOVEMENT_DOC_COL else None
+                doc_type = fmt.classify_document(str(sixth_col)) if pd.notna(sixth_col) else None
+                is_movement_doc = doc_type is not None
 
-                if first_five_empty and is_movement_doc:
+                if first_empty and is_movement_doc:
                     cell_val = sixth_col
                     if pd.notna(cell_val):
                         # Ищем дату в ячейке
@@ -122,16 +122,7 @@ class CalculationWorker(QThread):
                                 date_str = matches[0]
                                 date_found = datetime.strptime(date_str, '%d.%m.%y').date()
 
-                                # Определяем тип документа
                                 doc_text = str(cell_val)
-                                if 'Расходная накл.' in doc_text:
-                                    doc_type = "Расходная"
-                                elif 'Приходная накл.' in doc_text:
-                                    doc_type = "Приходная"
-                                elif 'Возврат' in doc_text:
-                                    doc_type = "Возврат"
-                                else:
-                                    doc_type = "Документ"
 
                                 # Извлекаем контрагента (часть после точки с запятой)
                                 counterparty = ""
@@ -140,8 +131,8 @@ class CalculationWorker(QThread):
                                     if len(parts) > 1:
                                         counterparty = parts[1].strip()
 
-                                incoming_qty_raw = row.iloc[7] if len(row) > 7 else None
-                                outgoing_qty_raw = row.iloc[8] if len(row) > 8 else None
+                                incoming_qty_raw = row.iloc[fmt.MOVEMENT_INCOMING_COL] if len(row) > fmt.MOVEMENT_INCOMING_COL else None
+                                outgoing_qty_raw = row.iloc[fmt.MOVEMENT_OUTGOING_COL] if len(row) > fmt.MOVEMENT_OUTGOING_COL else None
 
                                 incoming_qty = self.safe_float_convert(incoming_qty_raw, 0.0)
                                 outgoing_qty = self.safe_float_convert(outgoing_qty_raw, 0.0)
@@ -172,14 +163,12 @@ class CalculationWorker(QThread):
         total_codes = len(movement_data_by_code)
 
         # Предварительно создаём словарь начальных остатков для быстрого доступа
+        # (векторизованно, без построчного iterrows)
         initial_stock_map = {}
         if 'Код' in self.original_data.columns:
-            for _, row in self.original_data.iterrows():
-                code_str = str(row['Код'])
-                try:
-                    initial_stock_map[code_str] = float(row['Начальный остаток'])
-                except (ValueError, TypeError):
-                    initial_stock_map[code_str] = 0.0
+            codes = self.original_data['Код'].astype(str)
+            stocks = pd.to_numeric(self.original_data['Начальный остаток'], errors='coerce').fillna(0.0)
+            initial_stock_map = dict(zip(codes, stocks))
 
         for i, (code, records) in enumerate(movement_data_by_code.items()):
             if self._is_canceled:
@@ -251,111 +240,107 @@ class CalculationWorker(QThread):
         return df
 
     def run(self):
+        """Точка входа потока: гарантированно перехватывает любые исключения."""
         try:
-            if self.original_data is None or self.original_data.empty:
-                self.error.emit("Нет данных для расчёта")
-                return
-
-            start_date, end_date = self._extract_period_dates()
-            if self._is_canceled:
-                self.canceled.emit()
-                return
-
-            movement_data_by_code, movement_details_by_code = self._extract_movement_data()
-            if movement_data_by_code is None:
-                self.canceled.emit()
-                return
-            if self._is_canceled:
-                self.canceled.emit()
-                return
-
-            sales_data_by_code = self._calculate_sales_data(movement_data_by_code, start_date, end_date)
-            if sales_data_by_code is None:
-                self.canceled.emit()
-                return
-            if self._is_canceled:
-                self.canceled.emit()
-                return
-
-            pd = self.pd
-            np = self.np
-            df = self.original_data.copy()
-            df['Код_стр'] = df['Код'].astype(str)
-
-            df['Средняя продажа'] = df['Код_стр'].map(lambda x: sales_data_by_code.get(x, {}).get('avg_sales', 0.0))
-            df['total_sales'] = df['Код_стр'].map(lambda x: sales_data_by_code.get(x, {}).get('total_sales', 0.0))
-            df['days_with_sales'] = df['Код_стр'].map(lambda x: sales_data_by_code.get(x, {}).get('days_with_sales', 0))
-
-            log_days = self.settings.get('log_days', 15)
-            order_days = self.settings.get('order_days', 30)
-            safety_days = self.settings.get('safety_days', 15)
-            min_total_sales = self.settings.get('min_total_sales', 5)
-            min_sales_days = self.settings.get('min_sales_days', 5)
-
-            df['Лог. плечо (дни)'] = log_days
-            df['Кол-во дней заказа'] = order_days
-
-            df['Конечный остаток'] = pd.to_numeric(df['Конечный остаток'], errors='coerce').fillna(0)
-            df['Цена'] = pd.to_numeric(df['Цена'], errors='coerce').fillna(0)
-
-            df['Спрос за время доставки'] = log_days * df['Средняя продажа']
-            df['Страховой запас'] = safety_days * df['Средняя продажа']
-            df['Точка заказа'] = df['Спрос за время доставки'] + df['Страховой запас']
-            df['Спрос за интервал'] = order_days * df['Средняя продажа']
-            df['Целевой уровень'] = df['Точка заказа'] + df['Спрос за интервал']
-
-            low_sales_condition = (df['total_sales'] < min_total_sales) | (df['days_with_sales'] < min_sales_days)
-
-            # ========== НОВАЯ ЛОГИКА СТАТУСОВ ==========
-            conditions_status = [
-                low_sales_condition,                                     # 1. Малые продажи
-                df['Конечный остаток'] <= 0,                             # 2. Нет в наличии
-                (df['Конечный остаток'] < df['Целевой уровень']) & (~low_sales_condition) & (df['Конечный остаток'] > 0),  # 3. Нужен заказ
-                (df['Конечный остаток'] >= df['Целевой уровень']) & (~low_sales_condition) & (df['Конечный остаток'] > 0),  # 4. В достатке (бывший избыток)
-            ]
-            choices_status = [
-                "Малые продажи",
-                "Нет в наличии",
-                "Нужен заказ",
-                "В достатке",
-            ]
-            df['Статус заказа'] = np.select(conditions_status, choices_status, default="Нужен заказ")
-            # =============================================
-
-            df['Оптимальный заказ'] = 0
-
-            mask_order = (~low_sales_condition) & (df['Конечный остаток'] < df['Целевой уровень'])
-            df.loc[mask_order, 'Оптимальный заказ'] = np.maximum(
-                df.loc[mask_order, 'Целевой уровень'] - df.loc[mask_order, 'Конечный остаток'],
-                0
-            ).round().astype(int)
-
-            df['Заказ'] = 0
-            df['Сумма'] = 0.0
-
-            df['Страховой запас'] = df['Страховой запас'].round().astype(int)
-            df['Оптимальный заказ'] = df['Оптимальный заказ'].round().astype(int)
-            df['Конечный остаток'] = df['Конечный остаток'].round().astype(int)
-            df['Заказ'] = df['Заказ'].astype(int)
-
-            df = self._apply_user_orders(df)
-
-            cols_to_drop = [
-                'Код_стр', 'total_sales', 'days_with_sales',
-                'Спрос за время доставки', 'Точка заказа', 'Спрос за интервал'
-            ]
-            existing_cols = [col for col in cols_to_drop if col in df.columns]
-            if existing_cols:
-                df = df.drop(columns=existing_cols, errors='ignore')
-
-            _ = (pd, np)
-
-            self.finished.emit(df, movement_data_by_code, movement_details_by_code)
-
+            self._run_impl()
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            # Любая непредвиденная ошибка не должна «глушить» поток без сигнала.
+            logger.exception("Ошибка в worker-потоке")
             self.error.emit(str(e))
+
+    def _run_impl(self):
+        if self.original_data is None or self.original_data.empty:
+            self.error.emit("Нет данных для расчёта")
+            return
+
+        start_date, end_date = self._extract_period_dates()
+        if self._is_canceled:
+            self.canceled.emit()
+            return
+
+        movement_data_by_code, movement_details_by_code = self._extract_movement_data()
+        if movement_data_by_code is None:
+            self.canceled.emit()
+            return
+
+        sales_data_by_code = self._calculate_sales_data(movement_data_by_code, start_date, end_date)
+        if sales_data_by_code is None:
+            self.canceled.emit()
+            return
+        if self._is_canceled:
+            self.canceled.emit()
+            return
+
+        pd = self.pd
+        np = self.np
+        df = self.original_data.copy()
+        df['Код_стр'] = df['Код'].astype(str)
+
+        df['Средняя продажа'] = df['Код_стр'].map(lambda x: sales_data_by_code.get(x, {}).get('avg_sales', 0.0))
+        df['total_sales'] = df['Код_стр'].map(lambda x: sales_data_by_code.get(x, {}).get('total_sales', 0.0))
+        df['days_with_sales'] = df['Код_стр'].map(lambda x: sales_data_by_code.get(x, {}).get('days_with_sales', 0))
+
+        log_days = self.settings.get('log_days', 15)
+        order_days = self.settings.get('order_days', 30)
+        safety_days = self.settings.get('safety_days', 15)
+        min_total_sales = self.settings.get('min_total_sales', 5)
+        min_sales_days = self.settings.get('min_sales_days', 5)
+
+        df['Лог. плечо (дни)'] = log_days
+        df['Кол-во дней заказа'] = order_days
+
+        df['Конечный остаток'] = pd.to_numeric(df['Конечный остаток'], errors='coerce').fillna(0)
+        df['Цена'] = pd.to_numeric(df['Цена'], errors='coerce').fillna(0)
+
+        df['Спрос за время доставки'] = log_days * df['Средняя продажа']
+        df['Страховой запас'] = safety_days * df['Средняя продажа']
+        df['Точка заказа'] = df['Спрос за время доставки'] + df['Страховой запас']
+        df['Спрос за интервал'] = order_days * df['Средняя продажа']
+        df['Целевой уровень'] = df['Точка заказа'] + df['Спрос за интервал']
+
+        low_sales_condition = (df['total_sales'] < min_total_sales) | (df['days_with_sales'] < min_sales_days)
+
+        conditions_status = [
+            low_sales_condition,                                     # 1. Малые продажи
+            df['Конечный остаток'] <= 0,                             # 2. Нет в наличии
+            (df['Конечный остаток'] < df['Целевой уровень']) & (~low_sales_condition) & (df['Конечный остаток'] > 0),  # 3. Нужен заказ
+            (df['Конечный остаток'] >= df['Целевой уровень']) & (~low_sales_condition) & (df['Конечный остаток'] > 0),  # 4. В достатке
+        ]
+        choices_status = [
+            "Малые продажи",
+            "Нет в наличии",
+            "Нужен заказ",
+            "В достатке",
+        ]
+        df['Статус заказа'] = np.select(conditions_status, choices_status, default="Нужен заказ")
+
+        df['Оптимальный заказ'] = 0
+
+        mask_order = (~low_sales_condition) & (df['Конечный остаток'] < df['Целевой уровень'])
+        df.loc[mask_order, 'Оптимальный заказ'] = np.maximum(
+            df.loc[mask_order, 'Целевой уровень'] - df.loc[mask_order, 'Конечный остаток'],
+            0
+        ).round().astype(int)
+
+        df['Заказ'] = 0
+        df['Сумма'] = 0.0
+
+        df['Страховой запас'] = df['Страховой запас'].round().astype(int)
+        df['Оптимальный заказ'] = df['Оптимальный заказ'].round().astype(int)
+        df['Конечный остаток'] = df['Конечный остаток'].round().astype(int)
+        df['Заказ'] = df['Заказ'].astype(int)
+
+        df = self._apply_user_orders(df)
+
+        cols_to_drop = [
+            'Код_стр', 'total_sales', 'days_with_sales',
+            'Спрос за время доставки', 'Точка заказа', 'Спрос за интервал'
+        ]
+        existing_cols = [col for col in cols_to_drop if col in df.columns]
+        if existing_cols:
+            df = df.drop(columns=existing_cols, errors='ignore')
+
+        self.finished.emit(df, movement_data_by_code, movement_details_by_code)
 
     def cancel(self):
         self._is_canceled = True

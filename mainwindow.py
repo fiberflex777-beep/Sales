@@ -61,14 +61,9 @@ class MainWindow(QMainWindow, DataMixin, DialogsMixin):
         self.graph_timer.timeout.connect(self._update_graph_debounced)
         self._last_selected_code = None   # для предотвращения лишних обновлений
 
-        # Настройки по умолчанию
-        self.settings = {
-            'log_days': 15,
-            'order_days': 30,
-            'safety_days': 15,
-            'min_total_sales': 5,
-            'min_sales_days': 5
-        }
+        # Настройки (по умолчанию, затем перезагружаются из QSettings)
+        from dialogs import load_settings
+        self.settings = load_settings()
 
         # Сохранённый текст фильтра для восстановления после перерасчёта
         self._saved_filter_text = None
