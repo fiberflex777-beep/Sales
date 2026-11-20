@@ -245,8 +245,7 @@ class CalculationWorker(QThread):
             self._run_impl()
         except Exception as e:
             # Любая непредвиденная ошибка не должна «глушить» поток без сигнала.
-            import traceback
-            traceback.print_exc()
+            logger.exception("Ошибка в worker-потоке")
             self.error.emit(str(e))
 
     def _run_impl(self):

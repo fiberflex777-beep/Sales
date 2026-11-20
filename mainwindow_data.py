@@ -1,11 +1,15 @@
 # mainwindow_data.py
 import re
+import logging
 from datetime import datetime
 
 import pandas as pd
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QDialog
 from PyQt6.QtCore import QObject
 
+logger = logging.getLogger("app.data")
+
+import report_format as fmt
 from workers import CalculationWorker
 from dialogs import ProgressDialog
 from excel_exporter import export_order_to_excel, export_supplier_order_to_excel
@@ -57,6 +61,7 @@ class DataMixin(QObject):
             self._start_calculation(self.raw_df, self.headers_row_index, product_df, user_orders={})
 
         except Exception as e:
+            logger.exception("Ошибка загрузки файла отчёта")
             QMessageBox.critical(self, "Ошибка загрузки", f"Не удалось загрузить файл:\n{str(e)}")
 
     def _find_headers_row(self, df_raw):
@@ -99,8 +104,8 @@ class DataMixin(QObject):
         product_rows_df['Заказ'] = 0
 
         period_text = "Не найден"
-        if len(df_raw) > 4 and df_raw.shape[1] > 4:
-            raw_period_val = df_raw.iloc[4, 4]
+        if len(df_raw) >= fmt.MIN_ROWS_FOR_PERIOD and df_raw.shape[1] >= fmt.MIN_COLS_FOR_PERIOD:
+            raw_period_val = df_raw.iloc[fmt.PERIOD_CELL]
             if pandas.notna(raw_period_val):
                 period_text = str(raw_period_val).strip()
 
